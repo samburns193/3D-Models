@@ -1,0 +1,244 @@
+# ==============================================================================
+# Urra, Spain LiDAR DSM + RGB tiles -> cropped, aligned 3D GLB
+# ==============================================================================
+
+# Packages
+library(terra)
+library(rayshader)
+library(rgl)
+library(rgl2gltf)
+
+# ------------------------------------------------------------------------------
+# USER INPUTS
+# ------------------------------------------------------------------------------
+dsm_file  <- "Urra_LidarDSM/MDS02_ETRS89_H30_PM-2_1031-1.tif"
+rgb_files <- c("Urra_Aerial/PNOA_MA_OF_ETRS89_HU30_h25_1031_1.tif")
+out_glb   <- "urra_dsm.glb"
+
+# Your perfectly aligned Spanish UTM Zone 30N bounding box (~5.3km x 2.5km)
+my_small_aoi <- ext(576886.00, 582276.00, 4105278.00, 4107801.00)
+
+
+# ------------------------------------------------------------------------------
+# GLOBAL SETTINGS
+# ------------------------------------------------------------------------------
+
+# Geometry resolution for the mesh (m).
+# Native is 2m.
+geom_res_m <- 2.5
+
+# Rayshader camera / vertical scale
+zscale_val <- 2       # try 1 if you want less exaggeration
+sun_alt    <- 60      # used only if you enable 'ray' shading mode
+theta_val  <- 135
+phi_val    <- 35
+zoom_val   <- 0.9
+fov_val    <- 0
+
+# --- Shading mode for the texture over the mesh ---
+# "rgb_only" = aerial only (no synthetic shadows)  <-- eliminates dark streaks
+# "ambient"  = soft ambient occlusion (subtle relief)
+# "ray"      = directional shadows (can cause long dark bands)
+shading_mode <- "rgb_only"   # choose: "rgb_only", "ambient", or "ray"
+
+# --- GLB UV FIXES (for export only) ---
+# If the GLB looks sideways, set transpose_uv = TRUE.
+# If it looks upside-down, also set flip_v = TRUE.
+transpose_uv <- TRUE   # swaps X<->Y in the texture
+flip_v       <- FALSE  # vertical flip
+flip_h       <- FALSE  # (rare) horizontal flip
+
+# Debug checks (prints alignment info)
+debug_checks <- FALSE
+
+# ------------------------------------------------------------------------------
+# 1) LOAD, CROP & FORCE REAL MEMORY WRITE FOR DSM
+# ------------------------------------------------------------------------------
+dsm_raw   <- rast(dsm_file)
+dsm_temp  <- crop(dsm_raw, my_small_aoi)
+
+# FORCE REAL DEEP RAM COPY (This severs the link to the hard drive file structure)
+dsm       <- rast(dsm_temp) 
+values(dsm) <- values(dsm_temp)
+
+local_min_elevation <- minmax(dsm)[1]
+dsm[is.na(dsm)]     <- local_min_elevation
+
+# ------------------------------------------------------------------------------
+# 2) LOAD & CROP RGB IMAGERY (Fixed to bypass GDAL Error 3 cache crash)
+# ------------------------------------------------------------------------------
+to_rgb3 <- function(r) {
+  nl <- nlyr(r)
+  if (nl == 3) {
+    # ok
+  } else if (nl == 4) {
+    r <- r[[1:3]]
+  } else if (nl == 1) {
+    r <- rep(r, 3)
+  } else if (nl > 4) {
+    r <- r[[1:3]]
+  } else stop("Unexpected band count")
+  names(r) <- c("R","G","B")
+  r
+}
+
+# 1. Access file metadata pointers without unpacking pixels
+rgb_pointer <- rast(rgb_files)
+if (is.na(crs(rgb_pointer)) || crs(rgb_pointer) == "") crs(rgb_pointer) <- crs(dsm)
+
+# 2. Build a low-density reference footprint grid matching your target area resolution
+# This handles the spatial conversion step out of system memory buffers
+spatial_template <- rast(
+  ext = my_small_aoi,
+  crs = crs(dsm),
+  res = c(geom_res_m, geom_res_m) # Automatically uses your 2.5m setting
+)
+
+# 3. Use aggregate or spat-warp to bring down massive sizes before extraction
+# This processes the 0.25m pixels down to 4.0m BEFORE loading raw values to disk
+rgb_downsampled <- project(rgb_pointer, spatial_template, method = "bilinear")
+
+# 4. Convert structural channels into cleanly mapped RGB arrays
+rgb_rgb3   <- to_rgb3(rgb_downsampled)
+rgb_mosaic <- crop(rgb_rgb3, my_small_aoi)
+
+
+
+# ------------------------------------------------------------------------------
+# 3) CROP BOTH TO THEIR EXACT OVERLAP
+# ------------------------------------------------------------------------------
+overlap_ext <- terra::intersect(ext(dsm), ext(rgb_mosaic))
+dsm_crop    <- crop(dsm, overlap_ext, snap = "in")
+rgb_crop0   <- crop(rgb_mosaic, overlap_ext, snap = "in")
+
+# ------------------------------------------------------------------------------
+# 4) RESAMPLE RGB EXACTLY TO THE DSM GRID
+# ------------------------------------------------------------------------------
+rgb_resampled <- resample(rgb_crop0, dsm_crop, method = "bilinear")  
+
+# ------------------------------------------------------------------------------
+# 5) FOOTPRINT MASK
+# ------------------------------------------------------------------------------
+valid_mask    <- app(rgb_resampled, fun = function(x) any(!is.na(x)))
+dsm_masked    <- mask(dsm_crop,  valid_mask, maskvalues = 0, updatevalue = NA)
+rgb_masked    <- mask(rgb_resampled, valid_mask, maskvalues = 0, updatevalue = NA)
+dsm_masked[is.na(dsm_masked)] <- local_min_elevation
+
+# ------------------------------------------------------------------------------
+# 6) TRIM + ENSURE IDENTICAL EXTENT
+# ------------------------------------------------------------------------------
+dsm_masked <- trim(dsm_masked)
+rgb_masked <- trim(rgb_masked)
+common_ext <- intersect(ext(dsm_masked), ext(rgb_masked))
+dsm_masked <- crop(dsm_masked, common_ext)
+rgb_masked <- crop(rgb_masked, common_ext)
+
+# ------------------------------------------------------------------------------
+# 7) REGRID TO GEOMETRY RESOLUTION
+# ------------------------------------------------------------------------------
+same_res <- all(abs(res(dsm_masked) - c(geom_res_m, geom_res_m)) < 1e-9)
+
+if (same_res) {
+  dsm_geom <- dsm_masked
+  rgb_geom <- rgb_masked
+} else {
+  geom_template <- rast(
+    ext  = ext(dsm_masked),
+    crs  = crs(dsm_masked),
+    res  = c(geom_res_m, geom_res_m)
+  )
+  dsm_geom <- resample(dsm_masked, geom_template, method = "bilinear")
+  rgb_geom <- resample(rgb_masked, geom_template, method = "bilinear")
+}
+
+# ------------------------------------------------------------------------------
+# 9) RAYSHADER INPUTS (Aligned Matrix Alignment Fix)
+# ------------------------------------------------------------------------------
+elmat <- raster_to_matrix(dsm_geom)
+
+plotRGB(rgb_geom)
+
+# Extract values explicitly to avoid index mismatch distortion
+rgb_arr <- array(NA_real_,
+                 dim = c(nrow(rgb_geom),
+                         ncol(rgb_geom),
+                         3))
+
+rgb_arr[,,1] <- as.matrix(rgb_geom[[1]], wide = TRUE) / 255
+rgb_arr[,,2] <- as.matrix(rgb_geom[[2]], wide = TRUE) / 255
+rgb_arr[,,3] <- as.matrix(rgb_geom[[3]], wide = TRUE) / 255
+
+png("rgb_arr_test.png", width=1796, height=840)
+
+plot_map(rgb_arr)
+
+dev.off()
+
+if (debug_checks) {
+  cat("\n--- rayshader array checks ---\n")
+  print(dim(elmat)); print(dim(rgb_arr))
+  stopifnot(identical(dim(elmat), dim(rgb_arr)[1:2]))
+}
+
+
+# ------------------------------------------------------------------------------
+# 10) BUILD TEXTURE
+# ------------------------------------------------------------------------------
+if (shading_mode == "rgb_only") {
+  tex <- rgb_arr
+} else if (shading_mode == "ambient") {
+  amb <- ambient_shade(elmat, zscale = zscale_val)
+  tex <- add_overlay(rgb_arr, amb, alphalayer = 0.12)
+} else if (shading_mode == "ray") {
+  ray <- ray_shade(elmat, sunaltitude = sun_alt)
+  tex <- add_overlay(rgb_arr, ray, alphalayer = 0.10)
+} else {
+  stop("Unknown shading_mode. Use 'rgb_only', 'ambient', or 'ray'.")
+}
+
+# ------------------------------------------------------------------------------
+# 11) PREVIEW (in R)
+# ------------------------------------------------------------------------------
+rgl::clear3d()
+plot_3d(
+  hillshade = tex,
+  heightmap = elmat,
+  zscale    = zscale_val,
+  fov       = fov_val,
+  theta     = theta_val,
+  phi       = phi_val,
+  zoom      = zoom_val
+)
+
+png("urra_dsm_preview.png", width = 2000, height = 2000)
+plot_map(tex)  
+dev.off()
+
+# ------------------------------------------------------------------------------
+# 12) UV FIXES FOR GLB EXPORT
+# ------------------------------------------------------------------------------
+tex_glb <- tex
+# --- GLB UV FIXES FOR SPAIN DATA ---
+transpose_uv <- FALSE   # Turn FALSE to stop the texture from rotating sideways
+flip_v       <- TRUE    # Turn TRUE to flip the texture right-side up
+flip_h       <- FALSE   
+
+
+rgl::clear3d()
+plot_3d(
+  hillshade = tex_glb,
+  heightmap = elmat,
+  zscale    = zscale_val,
+  fov       = fov_val,
+  theta     = theta_val,
+  phi       = phi_val,
+  zoom      = zoom_val
+)
+
+
+# ------------------------------------------------------------
+# 13) EXPORT GLB
+# ------------------------------------------------------------
+scene <- rgl::scene3d()
+gltf  <- rgl2gltf::as.gltf(scene)
+rgl2gltf::writeGLB(gltf, out_glb)
